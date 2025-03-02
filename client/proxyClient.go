@@ -5,50 +5,71 @@ import (
 	"Draylix2/network"
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"fmt"
+	"github.com/oschwald/geoip2-golang"
 	"net"
 	"net/http"
 	"strings"
 )
 
-const (
-	HttpsProxy = iota
-	Socks5Proxy
-	HttpProxy
-)
+type ServerConfig struct {
+	addr string
+}
 
-const (
-	Ipv4 = iota
-	Domain
-)
-
-type ProxyInfo struct {
-	proxyType   byte
-	addrType    byte
-	addr        string
-	initialData []byte
+type ProxyClientConfig struct {
+	LocalAddr    string
+	ServerAddr   string
+	UserId       string
+	Passwd       string
+	MMDBFile     string
+	PoliciesFile string
+	TlsConfig    *tls.Config
 }
 
 type ProxyClient struct {
-	localAddr     string
+	ClientConfig  *ProxyClientConfig
 	listener      net.Listener
-	draylixConfig *network.DraylixConfig
+	proxySelector network.PolicySelector
 }
 
-func NewProxyClient(localAddr string, draylixConfig *network.DraylixConfig) *ProxyClient {
-	return &ProxyClient{
-		localAddr:     localAddr,
-		listener:      nil,
-		draylixConfig: draylixConfig,
+func NewProxyClient(clientConfig *ProxyClientConfig) *ProxyClient {
+	client := &ProxyClient{
+		ClientConfig:  clientConfig,
+		proxySelector: network.PolicySelector{},
 	}
+	db, err := geoip2.Open(clientConfig.MMDBFile)
+	if err != nil {
+		dlog.Warn("cannot open mmdb file: %s, %s", clientConfig.MMDBFile, err)
+	}
+	client.proxySelector.MMDB = db
+
+	err = client.proxySelector.LoadFromJson(clientConfig.PoliciesFile)
+	if err != nil {
+		dlog.Warn("cannot open policies file %s, %s", clientConfig.PoliciesFile, err)
+	}
+	return client
 }
 
-func (c *ProxyClient) Listen() error {
-	listener, err := net.Listen("tcp", c.localAddr)
+func (c *ProxyClient) LoadPolicies(file string) error {
+	return c.proxySelector.LoadFromJson(file)
+}
+
+func (c *ProxyClient) LoadMMDB(file string) error {
+	db, err := geoip2.Open(file)
 	if err != nil {
 		return err
 	}
-	dlog.Info("proxy client is listening at %s", c.localAddr)
+	c.proxySelector.MMDB = db
+	return nil
+}
+
+func (c *ProxyClient) Listen() error {
+	listener, err := net.Listen("tcp", c.ClientConfig.LocalAddr)
+	if err != nil {
+		return err
+	}
+	dlog.Info("proxy client is listening at %s", c.ClientConfig.LocalAddr)
 	c.listener = listener
 	go c.accept()
 	return nil
@@ -71,10 +92,15 @@ func (c *ProxyClient) handleLocalConn(conn net.Conn) {
 	if err != nil {
 		dlog.Error("failed to handle local connection: %v", err)
 	}
+	drlxConn, err := network.DialDraylixOverTls(c.ClientConfig.UserId, c.ClientConfig.Passwd, c.ClientConfig.ServerAddr, c.ClientConfig.TlsConfig)
+	if err != nil {
+		dlog.Error("can not connect to server : %s", err)
+	}
+	proxyConn, err := c.proxySelector.Select(drlxConn, conn, proxyInfo)
 
 }
 
-func getProxyInfo(conn net.Conn) (*ProxyInfo, error) {
+func getProxyInfo(conn net.Conn) (*network.ProxyInfo, error) {
 	buf := make([]byte, 4*1024)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -84,13 +110,13 @@ func getProxyInfo(conn net.Conn) (*ProxyInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	if proxyType == HttpProxy || proxyType == HttpsProxy {
+	if proxyType == network.HttpProxy || proxyType == network.HttpsProxy {
 		return parseHttpProxyInfo(buf[:n])
 	}
 	return parseSocks5ProxyInfo(conn)
 }
 
-func parseSocks5ProxyInfo(conn net.Conn) (*ProxyInfo, error) {
+func parseSocks5ProxyInfo(conn net.Conn) (*network.ProxyInfo, error) {
 	_, err := conn.Write([]byte{5, 0})
 	if err != nil {
 		return nil, err
@@ -104,24 +130,24 @@ func parseSocks5ProxyInfo(conn net.Conn) (*ProxyInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	info := &ProxyInfo{
-		proxyType: Socks5Proxy,
-		addrType:  Domain,
-		addr:      addr,
+	info := &network.ProxyInfo{
+		ProxyType: network.Socks5Proxy,
+		AddrType:  network.Domain,
+		Addr:      addr,
 	}
 	if network.IsValidIP(addr) {
-		info.addrType = Ipv4
+		info.AddrType = network.Ipv4
 	}
 	return info, nil
 }
 
 func parseProxyType(p []byte) (byte, error) {
 	if p[0] == 5 {
-		return Socks5Proxy, nil
+		return network.Socks5Proxy, nil
 	} else if strings.HasPrefix(string(p), "CONNECT") {
-		return HttpsProxy, nil
+		return network.HttpsProxy, nil
 	} else if isHttpProxy(p) {
-		return HttpProxy, nil
+		return network.HttpProxy, nil
 	} else {
 		return 0, fmt.Errorf("unknown proxy type")
 	}
@@ -170,7 +196,7 @@ func parseSocks5Addr(data []byte) (string, error) {
 	return targetHost, nil
 }
 
-func parseHttpProxyInfo(requestBytes []byte) (*ProxyInfo, error) {
+func parseHttpProxyInfo(requestBytes []byte) (*network.ProxyInfo, error) {
 	reader := bytes.NewReader(requestBytes)
 	req, err := http.ReadRequest(bufio.NewReader(reader))
 	if err != nil {
@@ -178,27 +204,27 @@ func parseHttpProxyInfo(requestBytes []byte) (*ProxyInfo, error) {
 	}
 	proxyType := parseHttpProxyType(req)
 	addr, addrType := parsHttpAddr(req)
-	info := &ProxyInfo{
-		proxyType: proxyType,
-		addrType:  addrType,
-		addr:      addr,
+	info := &network.ProxyInfo{
+		ProxyType: proxyType,
+		AddrType:  addrType,
+		Addr:      addr,
 	}
-	if proxyType == HttpProxy {
-		info.initialData = requestBytes
+	if proxyType == network.HttpProxy {
+		info.InitialData = requestBytes
 	}
 	return info, nil
 }
 
 func parsHttpAddr(req *http.Request) (string, byte) {
 	if network.IsValidIP(req.Host) {
-		return req.Host, Ipv4
+		return req.Host, network.Ipv4
 	}
-	return req.Host, Domain
+	return req.Host, network.Domain
 }
 
 func parseHttpProxyType(req *http.Request) byte {
 	if req.Method == "CONNECT" {
-		return HttpsProxy
+		return network.HttpsProxy
 	}
-	return HttpProxy
+	return network.HttpProxy
 }

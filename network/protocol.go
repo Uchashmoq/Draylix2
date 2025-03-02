@@ -1,6 +1,7 @@
 package network
 
 import (
+	"Draylix2/dlog"
 	"crypto/sha256"
 	"fmt"
 	"net"
@@ -13,6 +14,23 @@ const (
 	AuthSuccess
 )
 
+const (
+	Ipv4 = iota
+	Domain
+)
+
+const (
+	HttpsProxy = byte(iota)
+	Socks5Proxy
+	HttpProxy
+)
+
+var (
+	socks5Ipv4Start   = []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	socks5DomainStart = []byte{0x05, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	httpsStart        = []byte("HTTP/1.1 200 Connection established\r\n\r\n")
+)
+
 var (
 	Head    = []byte("drlx2")
 	HeadLen = len(Head)
@@ -20,6 +38,32 @@ var (
 
 type MessageType byte
 type Challenge int
+
+type ProxyInfo struct {
+	ProxyType   byte
+	AddrType    byte
+	Addr        string
+	InitialData []byte
+}
+
+func (p *ProxyInfo) getSuccessReply() []byte {
+	if p.ProxyType == HttpProxy {
+		return nil
+	}
+	if p.ProxyType == HttpsProxy {
+		return httpsStart
+	}
+	if p.ProxyType == Socks5Proxy {
+		if p.AddrType == Ipv4 {
+			return socks5Ipv4Start
+		} else {
+			return socks5DomainStart
+		}
+	}
+
+	dlog.Error("unknow proxy type %v", p.ProxyType)
+	return nil
+}
 
 type AuthMessage struct {
 	UserId    string
